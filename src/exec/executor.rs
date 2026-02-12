@@ -29,6 +29,8 @@ use super::jupiter::JupiterClient;
 
 const POLL_INTERVAL_MS: u64 = 800;
 const MIN_ASSET_DUST_RAW: u64 = 1;
+const OPEN_PENDING_TIMEOUT_MS: u64 = 20_000;
+const OPEN_MAX_ATTEMPTS: u8 = 2;
 
 #[derive(Clone, Debug)]
 struct PositionState {
@@ -167,6 +169,8 @@ struct PendingSwap {
     output_mint: Pubkey,
     input_amount: u64,
     expected_out_amount: Option<u64>,
+    attempt: u8,
+    submitted_at_ms: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -259,6 +263,11 @@ impl Executor {
                                     }
                                     if let Err(err) = self.submit_open(order).await {
                                         warn!("buy failed: {}", err);
+                                        self.emit_open_failed(format!(
+                                            "buy submit failed before pending: {}",
+                                            err
+                                        ))
+                                        .await;
                                     }
                                 }
                                 PositionOp::Close => {
@@ -294,8 +303,18 @@ impl Executor {
 
     async fn handle_control(&mut self, ctrl: ExecControl) {
         match ctrl {
-            ExecControl::Pause => self.is_paused = true,
-            ExecControl::Resume => self.is_paused = false,
+            ExecControl::Pause => {
+                self.is_paused = true;
+                if let Some(sender) = &self.market_tx {
+                    let _ = sender.send(MarketCommand::ExecutorPaused(true)).await;
+                }
+            }
+            ExecControl::Resume => {
+                self.is_paused = false;
+                if let Some(sender) = &self.market_tx {
+                    let _ = sender.send(MarketCommand::ExecutorPaused(false)).await;
+                }
+            }
             ExecControl::ForceClose => {
                 if self.position.is_some() && self.pending.is_empty() {
                     if let Err(err) = self.submit_close().await {
@@ -323,22 +342,7 @@ impl Executor {
         if amount == 0 {
             return Err(anyhow!("open notional converted to zero raw amount"));
         }
-        let submission = self
-            .jupiter
-            .swap(self.base_mint, self.asset_mint, amount)
-            .await?;
-        info!("BUY TX: {}", submission.signature);
-        self.pending.insert(
-            submission.signature,
-            PendingSwap {
-                intent: PositionOp::Open,
-                input_mint: submission.input_mint,
-                output_mint: submission.output_mint,
-                input_amount: submission.input_amount,
-                expected_out_amount: submission.expected_out_amount,
-            },
-        );
-        Ok(())
+        self.submit_open_amount(amount, 1).await
     }
 
     async fn submit_close(&mut self) -> Result<()> {
@@ -363,6 +367,83 @@ impl Executor {
                 output_mint: submission.output_mint,
                 input_amount: submission.input_amount,
                 expected_out_amount: submission.expected_out_amount,
+                attempt: 0,
+                submitted_at_ms: get_time_now(),
+            },
+        );
+        Ok(())
+    }
+
+    async fn handle_open_failure(&mut self, sig: Signature, pending: PendingSwap, reason: &str) {
+        warn!(
+            "open tx {} failed (attempt {}/{}): {}",
+            sig, pending.attempt, OPEN_MAX_ATTEMPTS, reason
+        );
+
+        if let Err(err) = self.sync_position_from_chain(reason).await {
+            warn!("open failure reconciliation error: {}", err);
+        }
+
+        if self.position.is_some() {
+            info!(
+                "open reconciliation found on-chain position after {}",
+                reason
+            );
+            return;
+        }
+
+        if pending.attempt < OPEN_MAX_ATTEMPTS {
+            let next_attempt = pending.attempt.saturating_add(1);
+            match self
+                .submit_open_amount(pending.input_amount, next_attempt)
+                .await
+            {
+                Ok(()) => {
+                    info!(
+                        "open retry submitted (attempt {}/{})",
+                        next_attempt, OPEN_MAX_ATTEMPTS
+                    )
+                }
+                Err(err) => {
+                    let msg = format!(
+                        "open retry failed after {} (attempt {}/{}): {}",
+                        reason, next_attempt, OPEN_MAX_ATTEMPTS, err
+                    );
+                    warn!("{}", msg);
+                    self.emit_open_failed(msg).await;
+                }
+            }
+        } else {
+            let msg = format!(
+                "open failed after max retries (attempt {}/{}): {}",
+                pending.attempt, OPEN_MAX_ATTEMPTS, reason
+            );
+            self.emit_open_failed(msg).await;
+        }
+    }
+
+    async fn submit_open_amount(&mut self, amount: u64, attempt: u8) -> Result<()> {
+        if amount == 0 {
+            return Err(anyhow!("open amount is zero"));
+        }
+        let submission = self
+            .jupiter
+            .swap(self.base_mint, self.asset_mint, amount)
+            .await?;
+        info!(
+            "BUY TX: {} (attempt {}/{})",
+            submission.signature, attempt, OPEN_MAX_ATTEMPTS
+        );
+        self.pending.insert(
+            submission.signature,
+            PendingSwap {
+                intent: PositionOp::Open,
+                input_mint: submission.input_mint,
+                output_mint: submission.output_mint,
+                input_amount: submission.input_amount,
+                expected_out_amount: submission.expected_out_amount,
+                attempt,
+                submitted_at_ms: get_time_now(),
             },
         );
         Ok(())
@@ -383,6 +464,20 @@ impl Executor {
         let mut completed: Vec<Signature> = Vec::new();
 
         for (sig, status_opt) in signatures.iter().zip(statuses.iter()) {
+            let pending = match self.pending.get(sig) {
+                Some(pending) => pending.clone(),
+                None => continue,
+            };
+
+            if pending.intent == PositionOp::Open
+                && get_time_now().saturating_sub(pending.submitted_at_ms) >= OPEN_PENDING_TIMEOUT_MS
+            {
+                self.handle_open_failure(*sig, pending, "open pending timeout")
+                    .await;
+                completed.push(*sig);
+                continue;
+            }
+
             let status = match status_opt {
                 Some(status) => status,
                 None => continue,
@@ -390,7 +485,12 @@ impl Executor {
 
             if status.err.is_some() {
                 warn!("tx {} failed: {:?}", sig, status.err);
-                let _ = self.sync_position_from_chain("tx failed").await;
+                if pending.intent == PositionOp::Open {
+                    self.handle_open_failure(*sig, pending, "tx status error")
+                        .await;
+                } else {
+                    let _ = self.sync_position_from_chain("tx failed").await;
+                }
                 completed.push(*sig);
                 continue;
             }
@@ -410,6 +510,14 @@ impl Executor {
                 Ok(tx) => tx,
                 Err(err) => {
                     warn!("tx {} not available yet: {}", sig, err);
+                    if pending.intent == PositionOp::Open
+                        && get_time_now().saturating_sub(pending.submitted_at_ms)
+                            >= OPEN_PENDING_TIMEOUT_MS
+                    {
+                        self.handle_open_failure(*sig, pending, "tx fetch timeout")
+                            .await;
+                        completed.push(*sig);
+                    }
                     continue;
                 }
             };
@@ -417,18 +525,18 @@ impl Executor {
             if let Some(meta) = &tx.transaction.meta {
                 if meta.err.is_some() {
                     warn!("tx {} meta error: {:?}", sig, meta.err);
-                    let _ = self.sync_position_from_chain("tx meta error").await;
+                    if pending.intent == PositionOp::Open {
+                        self.handle_open_failure(*sig, pending, "tx meta error")
+                            .await;
+                    } else {
+                        let _ = self.sync_position_from_chain("tx meta error").await;
+                    }
                     completed.push(*sig);
                     continue;
                 }
             } else {
                 continue;
             }
-
-            let pending = match self.pending.get(sig) {
-                Some(pending) => pending.clone(),
-                None => continue,
-            };
 
             self.apply_fill(*sig, &pending, &tx).await;
             completed.push(*sig);
@@ -710,6 +818,13 @@ impl Executor {
         }
 
         if let Some(sender) = &self.market_tx {
+            let _ = sender.send(MarketCommand::OpenPosition(None)).await;
+        }
+    }
+
+    async fn emit_open_failed(&self, reason: String) {
+        if let Some(sender) = &self.market_tx {
+            let _ = sender.send(MarketCommand::OpenFailed(reason)).await;
             let _ = sender.send(MarketCommand::OpenPosition(None)).await;
         }
     }

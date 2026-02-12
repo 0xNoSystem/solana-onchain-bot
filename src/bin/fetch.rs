@@ -105,11 +105,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         engine_rs::ExecParam::OpenPosition(pos),
                     ));
                 }
+                MarketCommand::OpenFailed(reason) => {
+                    log::warn!("MARKET: open failed: {}", reason);
+                    let _ = engine_tx_market.send(EngineCommand::OpenFailed(reason));
+                }
                 MarketCommand::IndicatorData(data) => {
                     log::info!("MARKET: indicator data len={}", data.len());
                 }
                 MarketCommand::EngineState(state) => {
                     log::info!("MARKET: engine state {:?}", state);
+                }
+                MarketCommand::ExecutorPaused(paused) => {
+                    log::info!("MARKET: executor paused={}", paused);
                 }
             }
         }

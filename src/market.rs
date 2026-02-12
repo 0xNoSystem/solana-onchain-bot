@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -14,7 +15,6 @@ use tokio::task::JoinHandle;
 use crate::birdeye::{BirdeyeClient, QuoteCurrency};
 use crate::exec::Executor;
 use crate::info::StreamManager;
-use crate::signal::IndexId;
 use crate::{
     BalanceSync, EngineCommand, ExecCommand, ExecControl, ExecParam, ExecParams, MarketCommand,
     Price, SOL_MINT, SignalEngine, Strategy, TimeFrame,
@@ -27,8 +27,6 @@ const MAINNET_RPC: &str = "https://api.mainnet-beta.solana.com";
 pub struct MarketConfig {
     pub token_mint: Pubkey,
     pub strategy: Strategy,
-    pub indicators: Vec<IndexId>,
-    pub timeframe: TimeFrame,
     pub quote_currency: QuoteCurrency,
     pub bootstrap_candles: u64,
     pub slippage_bps: u16,
@@ -39,8 +37,6 @@ impl MarketConfig {
         Self {
             token_mint,
             strategy: Strategy::RsiClassic,
-            indicators: Vec::new(),
-            timeframe: TimeFrame::Min1,
             quote_currency: QuoteCurrency::Sol,
             bootstrap_candles: 1000,
             slippage_bps: 400,
@@ -76,14 +72,20 @@ impl Market {
         event_tx: Option<UnboundedSender<MarketEvent>>,
     ) -> Result<Self> {
         let token_str = cfg.token_mint.to_string();
-        let candles = birdeye
-            .fetch_candles(
-                &token_str,
-                cfg.timeframe,
-                cfg.quote_currency,
-                cfg.bootstrap_candles,
-            )
-            .await?;
+        let active_tfs: HashSet<TimeFrame> = cfg
+            .strategy
+            .indicators()
+            .into_iter()
+            .map(|id| id.1)
+            .collect();
+
+        let mut bootstrap_data = Vec::with_capacity(active_tfs.len());
+        for tf in active_tfs {
+            let candles = birdeye
+                .fetch_candles(&token_str, tf, cfg.quote_currency, cfg.bootstrap_candles)
+                .await?;
+            bootstrap_data.push((tf, candles));
+        }
 
         let (engine_tx, engine_rx) = mpsc::unbounded_channel();
         let (trade_tx, trade_rx) = bounded(0);
@@ -94,7 +96,7 @@ impl Market {
         let exec_params = ExecParams::new(balance);
 
         let mut engine = SignalEngine::new(
-            Some(cfg.indicators),
+            None,
             cfg.strategy,
             engine_rx,
             Some(market_tx.clone()),
@@ -102,7 +104,9 @@ impl Market {
             exec_params,
         )
         .await;
-        engine.load(cfg.timeframe, candles).await;
+        for (tf, candles) in bootstrap_data {
+            engine.load(tf, candles).await;
+        }
 
         let base_mint = Pubkey::from_str(SOL_MINT)?;
         let executor_rpc_url = std::env::var("EXECUTOR_RPC_URL")
@@ -133,10 +137,16 @@ impl Market {
         let event_tx_market = event_tx.clone();
         let relay_task = tokio::spawn(async move {
             while let Some(cmd) = market_rx.recv().await {
-                if let MarketCommand::OpenPosition(pos) = cmd {
-                    let _ = engine_tx_market.send(EngineCommand::UpdateExecParams(
-                        ExecParam::OpenPosition(pos),
-                    ));
+                match &cmd {
+                    MarketCommand::OpenPosition(pos) => {
+                        let _ = engine_tx_market.send(EngineCommand::UpdateExecParams(
+                            ExecParam::OpenPosition(*pos),
+                        ));
+                    }
+                    MarketCommand::OpenFailed(reason) => {
+                        let _ = engine_tx_market.send(EngineCommand::OpenFailed(reason.clone()));
+                    }
+                    _ => {}
                 }
                 if let Some(tx) = &event_tx_market {
                     let _ = tx.send(MarketEvent::Command {

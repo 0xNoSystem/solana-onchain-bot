@@ -549,6 +549,24 @@ impl SignalEngine {
                     }
                 }
 
+                EngineCommand::OpenFailed(reason) => {
+                    self.exec_params.open_pos = None;
+                    let was_opening = matches!(self.state, EngineState::Opening(_));
+                    if self.state != EngineState::Idle {
+                        self.state = EngineState::Idle;
+                        if let Some(sender) = &self.data_tx {
+                            let _ = sender
+                                .send(MarketCommand::EngineState(self.state.into()))
+                                .await;
+                        }
+                    }
+                    if was_opening {
+                        log::warn!("open failed and engine reset to Idle: {}", reason);
+                    } else {
+                        log::warn!("executor open failure reported: {}", reason);
+                    }
+                }
+
                 EngineCommand::ExecToggle => {
                     if !self.paused {
                         self.paused = true;
@@ -704,6 +722,7 @@ pub enum EngineCommand {
         price_data: Option<TimeFrameData>,
     },
     UpdateExecParams(ExecParam),
+    OpenFailed(String),
     ExecToggle,
     Stop,
 }
@@ -748,7 +767,9 @@ enum PendingOrder {
 pub enum MarketCommand {
     IndicatorData(Vec<IndicatorData>),
     EngineState(EngineView),
+    ExecutorPaused(bool),
     OpenPosition(Option<OpenPosInfo>),
+    OpenFailed(String),
     SwapFill(SwapFill),
     Trade(TradeInfo),
 }

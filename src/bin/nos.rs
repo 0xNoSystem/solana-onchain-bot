@@ -158,10 +158,16 @@ async fn main() -> Result<()> {
     let event_tx_market = event_tx.clone();
     tokio::spawn(async move {
         while let Some(cmd) = market_rx.recv().await {
-            if let MarketCommand::OpenPosition(pos) = cmd {
-                let _ = engine_tx_market.send(EngineCommand::UpdateExecParams(
-                    ExecParam::OpenPosition(pos),
-                ));
+            match &cmd {
+                MarketCommand::OpenPosition(pos) => {
+                    let _ = engine_tx_market.send(EngineCommand::UpdateExecParams(
+                        ExecParam::OpenPosition(*pos),
+                    ));
+                }
+                MarketCommand::OpenFailed(reason) => {
+                    let _ = engine_tx_market.send(EngineCommand::OpenFailed(reason.clone()));
+                }
+                _ => {}
             }
             let _ = event_tx_market.send(AppEvent::Market(cmd));
         }
@@ -275,6 +281,11 @@ fn apply_event(app: &mut AppState, msg: AppEvent) {
             MarketCommand::IndicatorData(indicators) => apply_indicators(app, indicators),
             MarketCommand::EngineState(state) => app.engine_state = state,
             MarketCommand::OpenPosition(pos) => app.open_pos = pos,
+            MarketCommand::OpenFailed(_) => {
+                app.open_pos = None;
+                app.engine_state = EngineView::Idle;
+            }
+            MarketCommand::ExecutorPaused(_) => {}
             MarketCommand::SwapFill(_) => {}
             MarketCommand::Trade(trade) => {
                 app.total_pnl += trade.pnl;

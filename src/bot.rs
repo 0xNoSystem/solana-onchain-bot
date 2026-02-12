@@ -176,17 +176,15 @@ impl Bot {
             }
             BotCommand::PauseMarket(token_mint) => {
                 if let Some(market) = self.markets.get(&token_mint) {
-                    let _ = market.pause().await;
-                    if let Some(state) = self.session.get_mut(&token_mint) {
-                        state.is_paused = true;
+                    if let Err(err) = market.pause().await {
+                        log::warn!("pause failed for {}: {}", token_mint, err);
                     }
                 }
             }
             BotCommand::ResumeMarket(token_mint) => {
                 if let Some(market) = self.markets.get(&token_mint) {
-                    let _ = market.resume().await;
-                    if let Some(state) = self.session.get_mut(&token_mint) {
-                        state.is_paused = false;
+                    if let Err(err) = market.resume().await {
+                        log::warn!("resume failed for {}: {}", token_mint, err);
                     }
                 }
             }
@@ -197,18 +195,16 @@ impl Bot {
             }
             BotCommand::PauseAll => {
                 for market in self.markets.values() {
-                    let _ = market.pause().await;
-                }
-                for state in self.session.values_mut() {
-                    state.is_paused = true;
+                    if let Err(err) = market.pause().await {
+                        log::warn!("pause all failed: {}", err);
+                    }
                 }
             }
             BotCommand::ResumeAll => {
                 for market in self.markets.values() {
-                    let _ = market.resume().await;
-                }
-                for state in self.session.values_mut() {
-                    state.is_paused = false;
+                    if let Err(err) = market.resume().await {
+                        log::warn!("resume all failed: {}", err);
+                    }
                 }
             }
             BotCommand::CloseAll => {
@@ -363,6 +359,14 @@ impl Bot {
                         }
                         crate::MarketCommand::IndicatorData(indicators) => {
                             state.indicators = indicators;
+                        }
+                        crate::MarketCommand::ExecutorPaused(paused) => {
+                            state.is_paused = paused;
+                        }
+                        crate::MarketCommand::OpenFailed(reason) => {
+                            log::warn!("market {} open failed: {}", token_mint, reason);
+                            state.open_pos = None;
+                            state.engine_state = EngineView::Idle;
                         }
                         crate::MarketCommand::Trade(trade) => {
                             let trade_key = if trade.close_tx_hash.is_empty() {

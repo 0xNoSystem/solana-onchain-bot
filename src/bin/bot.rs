@@ -21,7 +21,7 @@ use engine_rs::birdeye::BirdeyeClient;
 use engine_rs::helpers::read_keypair_from_file;
 use engine_rs::{
     AddMarketInfo, Bot, BotCommand, BotSnapshot, EngineView, MarginAllocation, MarketConfig,
-    MarketState, Strategy, TimeFrame,
+    MarketState, Strategy,
 };
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -113,6 +113,7 @@ fn default_strategy_index() -> usize {
 enum Mode {
     Normal,
     Add(AddForm),
+    ConfirmQuit,
 }
 
 #[derive(Debug, Clone)]
@@ -132,7 +133,7 @@ impl AppState {
             snapshot: BotSnapshot::default(),
             selected: 0,
             mode: Mode::Normal,
-            status: "a add | d remove | p pause | up/down move | q quit".to_string(),
+            status: "a add | d remove | p pause/resume | up/down move | q quit".to_string(),
             should_quit: false,
         }
     }
@@ -314,6 +315,7 @@ async fn handle_key(
     match app.mode.clone() {
         Mode::Normal => handle_normal_key(app, code, modifiers, bot_tx).await,
         Mode::Add(_) => handle_add_key(app, code, modifiers, bot_tx).await,
+        Mode::ConfirmQuit => handle_confirm_quit_key(app, code, modifiers),
     }
 }
 
@@ -324,7 +326,10 @@ async fn handle_normal_key(
     bot_tx: &Sender<BotCommand>,
 ) {
     match code {
-        KeyCode::Char('q') => app.should_quit = true,
+        KeyCode::Char('q') => {
+            app.mode = Mode::ConfirmQuit;
+            app.status = "confirm quit: [Y]es [N]o".to_string();
+        }
         KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => app.should_quit = true,
         KeyCode::Up | KeyCode::Char('k') => app.move_selection_up(),
         KeyCode::Down | KeyCode::Char('j') => app.move_selection_down(),
@@ -352,17 +357,38 @@ async fn handle_normal_key(
         KeyCode::Char('p') => {
             if let Some(market) = app.selected_market() {
                 let mint = market.token_mint;
-                match bot_tx.send(BotCommand::PauseMarket(mint)).await {
+                let (cmd, action) = if market.is_paused {
+                    (BotCommand::ResumeMarket(mint), "resume")
+                } else {
+                    (BotCommand::PauseMarket(mint), "pause")
+                };
+                match bot_tx.send(cmd).await {
                     Ok(_) => {
-                        app.status = format!("pause requested for {}", mint);
+                        app.status = format!("{} requested for {}", action, mint);
                     }
                     Err(err) => {
-                        app.status = format!("pause failed to send: {}", err);
+                        app.status = format!("{} failed to send: {}", action, err);
                     }
                 }
             } else {
                 app.status = "no market selected".to_string();
             }
+        }
+        _ => {}
+    }
+}
+
+fn handle_confirm_quit_key(app: &mut AppState, code: KeyCode, modifiers: KeyModifiers) {
+    match code {
+        KeyCode::Char('y') | KeyCode::Char('Y') => {
+            app.should_quit = true;
+        }
+        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+            app.mode = Mode::Normal;
+            app.status = "quit cancelled".to_string();
+        }
+        KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => {
+            app.should_quit = true;
         }
         _ => {}
     }
@@ -468,6 +494,7 @@ async fn handle_add_key(
     let mut form = match app.mode.clone() {
         Mode::Add(form) => form,
         Mode::Normal => return,
+        Mode::ConfirmQuit => return,
     };
 
     match code {
@@ -584,8 +611,6 @@ async fn submit_add(app: &mut AppState, form: AddForm, bot_tx: &Sender<BotComman
 
     let mut market_cfg = MarketConfig::new(mint);
     market_cfg.strategy = strategy_opt.strategy;
-    market_cfg.timeframe = TimeFrame::Min1;
-    market_cfg.indicators = strategy_opt.strategy.indicators();
 
     let add = AddMarketInfo {
         market_cfg,
@@ -667,12 +692,16 @@ fn render(frame: &mut Frame, app: &AppState) {
     if let Mode::Add(form) = &app.mode {
         render_add_modal(frame, form);
     }
+    if matches!(app.mode, Mode::ConfirmQuit) {
+        render_quit_confirm_modal(frame);
+    }
 }
 
 fn render_status_header(frame: &mut Frame, app: &AppState, area: Rect) {
     let mode_label = match app.mode {
         Mode::Normal => "Normal",
         Mode::Add(_) => "Add Market",
+        Mode::ConfirmQuit => "Confirm Quit",
     };
     let sol_price = format_sol_usd(app.snapshot.sol_price_usd);
     let sol_style = if app.snapshot.sol_price_usd.is_some() {
@@ -747,7 +776,7 @@ fn render_market_list(frame: &mut Frame, app: &AppState, area: Rect) {
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .title("Markets (a add, d remove, p pause)");
+        .title("Markets (a add, d remove, p pause/resume)");
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -1038,9 +1067,12 @@ fn render_selected_market(frame: &mut Frame, app: &AppState, area: Rect) {
         )])]
     };
 
-    let details = Paragraph::new(lines)
-        .wrap(Wrap { trim: true })
-        .block(Block::default().borders(Borders::ALL).title("Selected"));
+    let details = Paragraph::new(lines).wrap(Wrap { trim: true }).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title("Selected")
+            .style(Style::default().bg(Color::Rgb(10, 55, 20))),
+    );
     frame.render_widget(details, area);
 }
 
@@ -1054,27 +1086,29 @@ fn render_footer(frame: &mut Frame, app: &AppState, area: Rect) {
 fn render_add_modal(frame: &mut Frame, form: &AddForm) {
     let area = centered_rect(70, 40, frame.area());
     frame.render_widget(Clear, area);
+    let modal_bg = Color::Rgb(242, 238, 228);
+    let active_color = Color::Rgb(255, 165, 0);
 
     let mint_style = if form.active == AddField::Mint {
         Style::default()
-            .fg(Color::Yellow)
+            .fg(active_color)
             .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(Color::White)
+        Style::default().fg(Color::Black)
     };
     let alloc_style = if form.active == AddField::Alloc {
         Style::default()
-            .fg(Color::Yellow)
+            .fg(active_color)
             .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(Color::White)
+        Style::default().fg(Color::Black)
     };
     let strat_style = if form.active == AddField::Strategy {
         Style::default()
-            .fg(Color::Yellow)
+            .fg(active_color)
             .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(Color::White)
+        Style::default().fg(Color::Black)
     };
 
     let strategy_label = STRATEGY_OPTIONS
@@ -1086,16 +1120,16 @@ fn render_add_modal(frame: &mut Frame, form: &AddForm) {
         Line::from("Create market"),
         Line::from(""),
         Line::from(vec![
-            Span::styled("Mint:   ", Style::default().fg(Color::Gray)),
+            Span::styled("Mint:   ", Style::default().fg(Color::Black)),
             Span::styled(form.mint.as_str(), mint_style),
         ]),
         Line::from(vec![
-            Span::styled("Margin: ", Style::default().fg(Color::Gray)),
+            Span::styled("Margin: ", Style::default().fg(Color::Black)),
             Span::styled(format!("{} SOL", form.margin_sol), alloc_style),
         ]),
         Line::from(""),
         Line::from(vec![
-            Span::styled("Strat:  ", Style::default().fg(Color::Gray)),
+            Span::styled("Strat:  ", Style::default().fg(Color::Black)),
             Span::styled(strategy_label, strat_style),
         ]),
         Line::from(vec![
@@ -1106,12 +1140,41 @@ fn render_add_modal(frame: &mut Frame, form: &AddForm) {
         Line::from("tab/up/down field | <-/-> strategy | enter submit | esc cancel"),
     ];
 
-    let modal = Paragraph::new(lines).wrap(Wrap { trim: true }).block(
+    let modal = Paragraph::new(lines)
+        .style(Style::default().fg(Color::Black).bg(modal_bg))
+        .wrap(Wrap { trim: true })
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Add Market (margin SOL > 0.0)")
+                .style(Style::default().bg(modal_bg))
+                .border_style(Style::default().fg(Color::Black)),
+        );
+    frame.render_widget(modal, area);
+}
+
+fn render_quit_confirm_modal(frame: &mut Frame) {
+    let area = centered_rect(44, 22, frame.area());
+    frame.render_widget(Clear, area);
+
+    let lines = vec![
+        Line::from(Span::styled(
+            "Close session?",
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from("[Y]es    [N]o"),
+        Line::from("Esc = No"),
+    ];
+
+    let popup = Paragraph::new(lines).wrap(Wrap { trim: true }).block(
         Block::default()
             .borders(Borders::ALL)
-            .title("Add Market (margin SOL > 0.0)"),
+            .title("Confirm Quit")
+            .style(Style::default().bg(Color::Black))
+            .border_style(Style::default().fg(Color::Yellow)),
     );
-    frame.render_widget(modal, area);
+    frame.render_widget(popup, area);
 }
 
 fn strategy_options_line(selected_idx: usize) -> Span<'static> {
@@ -1128,7 +1191,7 @@ fn strategy_options_line(selected_idx: usize) -> Span<'static> {
         .collect::<Vec<_>>()
         .join(" | ");
 
-    Span::styled(text, Style::default().fg(Color::Cyan))
+    Span::styled(text, Style::default().fg(Color::Black))
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
@@ -1166,7 +1229,7 @@ fn indicator_line(indicator: &engine_rs::IndicatorData) -> Line<'static> {
     let value = indicator
         .value
         .as_ref()
-        .map(|v| truncate_middle(&format!("{:?}", v), 60))
+        .map(|v| truncate_middle(&format_indicator_value(v), 60))
         .unwrap_or_else(|| "--".to_string());
 
     Line::from(vec![
@@ -1174,6 +1237,23 @@ fn indicator_line(indicator: &engine_rs::IndicatorData) -> Line<'static> {
         Span::raw(" = "),
         Span::raw(value),
     ])
+}
+
+fn format_indicator_value(value: &engine_rs::Value) -> String {
+    match value {
+        engine_rs::Value::RsiValue(v) => format!("{:.2}", v),
+        engine_rs::Value::SmaRsiValue(v) => format!("{:.2}", v),
+        engine_rs::Value::AdxValue(v) => format!("{:.2}", v),
+        engine_rs::Value::AtrValue(v) => format!("{:.6}", v),
+        engine_rs::Value::StochRsiValue { k, d } => format!("K {:.2} | D {:.2}", k, d),
+        engine_rs::Value::EmaCrossValue { short, long, trend } => format!(
+            "short {:.6} | long {:.6} | trend {}",
+            short,
+            long,
+            if *trend { "UP" } else { "DOWN" }
+        ),
+        _ => format!("{:?}", value),
+    }
 }
 
 fn compute_market_cap_usd(market: &MarketState, sol_price_usd: Option<f64>) -> Option<f64> {
